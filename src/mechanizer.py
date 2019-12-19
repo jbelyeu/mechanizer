@@ -41,6 +41,11 @@ def setup_args():
         help="bed file of repeats that might act as NAHR substrates, where the header of the bed file identifies the coordinates of `chrom,start,end,otherChrom,otherStart,otherEnd`",
         required=True,
     )
+    parser.add_argument(
+        "--rmsk",
+        help="bed file of repeatmasker repeats to identify retrotransposons, GGD or similar header required",
+        required=True,
+    )
     args = parser.parse_args()
 
     if not args.bed:
@@ -77,7 +82,7 @@ def measure_homology(ref_file, chrom, start, end):
     return matchlen
 
 
-def goodread(read):
+def goodread(read, ignore_mate=False):
     if not read:
         return False
     if (read.is_qcfail
@@ -86,12 +91,13 @@ def goodread(read):
             or int(read.mapping_quality) < MIN_MAPQ
             or read.is_secondary
             or read.is_supplementary
-            or (read.next_reference_id != read.reference_id)
+            ) or ((read.next_reference_id != read.reference_id) and not ignore_mate
     ):
         return False
     return True
 
-def get_reads(bam_filehandle, chrom, start, end):
+def get_reads(bamfile, chrom, start, end):
+    bam_filehandle = pysam.AlignmentFile(bamfile)
     bamit = None
     try:
         bamit = bam_filehandle.fetch(chrom, start, end)
@@ -107,10 +113,9 @@ def get_reads(bam_filehandle, chrom, start, end):
 
 def get_splits(bamfile, chrom, start, end):
     splits = []
-    bam_filehandle = pysam.AlignmentFile(bamfile)
     chrom = str(chrom)
-    reads = get_reads(bam_filehandle, chrom, max(0,start-SPLITTER_ERR_MARGIN), start+SPLITTER_ERR_MARGIN)
-    reads += get_reads(bam_filehandle, chrom, max(0,end-SPLITTER_ERR_MARGIN), end+SPLITTER_ERR_MARGIN)
+    reads = get_reads(bamfile, chrom, max(0,start-SPLITTER_ERR_MARGIN), start+SPLITTER_ERR_MARGIN)
+    reads += get_reads(bamfile, chrom, max(0,end-SPLITTER_ERR_MARGIN), end+SPLITTER_ERR_MARGIN)
 
     for read in reads:
         ref_positions = read.get_reference_positions()
@@ -225,7 +230,6 @@ def to_int(field):
         return field
 
 
-
 def parse_repeats(bed):
     encoding = "utf-8"
     repeats = []
@@ -246,19 +250,44 @@ def parse_repeats(bed):
                 for i,required_field in enumerate(required_fields):
                     repeat_entry.append(to_int(fields[header_idxs[required_field]]))
                 repeats.append(repeat_entry)
-    return pd.DataFrame(repeats, columns=required_fields)
+    df = pd.DataFrame(repeats, columns=required_fields)
+    df['chrom'].astype(str)
+    return df
 
-def has_flanking_repeats(sv, repeat_file):
+def parse_repeat_masker(bed):
+    encoding = "utf-8"
+    repeats = []
+    required_fields = ["chrom","start","end","family_class_name"]
+    with gzip.open(bed, 'r') as repeat_file:
+        header_idxs = {}
+        for line in repeat_file:
+            line = line.decode(encoding)
+            if line[0] == "#":
+                header_fields = line.lower().strip("#").split()
+                for required_field in required_fields:
+                    if not required_field in header_fields:
+                        sys.exit("missing required header field "+required_field+"in repeats file")
+                    header_idxs[required_field] = header_fields.index(required_field)
+            else:
+                repeat_entry = []
+                fields = line.strip().split()
+                for i,required_field in enumerate(required_fields):
+                    repeat_entry.append(to_int(fields[header_idxs[required_field]]))
+                repeats.append(repeat_entry)
+    df = pd.DataFrame(repeats, columns=required_fields)
+    df['chrom'].astype(str)
+    return df
+
+
+def has_flanking_repeats(sv, repeats):
     if sv.loc['svtype'] not in ["DEL","DUP"]:
         return False
 
-    repeats = parse_repeats(repeat_file)
     # find all the repeat pairs where 
     # the first of the pair ends within 100 bp before the SV start and not after SV start
     # and the second of the pair starts after the SV end and within 100 bp after the SV end
     search_dist = int((sv.loc['end']-sv.loc['start'])/20)
 
-    repeats["chrom"] = repeats['chrom'].astype(str)
     candidates = repeats[
               ((repeats["chrom"] == str(sv.loc['chrom']).strip("chr")) 
                   | (repeats["chrom"] == "chr"+str(sv.loc['chrom']))) 
@@ -270,24 +299,95 @@ def has_flanking_repeats(sv, repeat_file):
 
     return (len(candidates) > 0)
 
+def get_tabix_iter(chrom, start, end, tbx):
+    itr = None
+    try:
+        itr = tbx.fetch(chrom, max(0, start-1000), end+1000)
+    except ValueError:
+        # try and account for chr/no chr prefix
+        if chrom[:3] == 'chr':
+            chrom = chrom[3:]
+        else:
+            chrom = 'chr' + chrom
+
+        try:
+            itr = tbx.fetch(chrom, max(0,start-1000), end+1000)
+        except ValueError as e:
+            print('Warning: Could not fetch ' + \
+                    chrom + ':' + str(start) + '-' + str(end) + \
+                    ' from ' + datafile)
+            print(e)
+    return itr
+
+
+def has_retrotransposon_scar(sv, retros_tbx):
+    """
+    """
+    if sv.loc['svtype'] != "INS":
+        return False,0
+
+    retro_matches = {
+        "LINE": 0,
+        "SINE": 0,
+        "SVA": 0
+    }
+    
+    reads = get_reads(sv.loc["bam"], sv.loc['chrom'], sv.loc['start']-200, sv.loc['end']+200)
+    for read in reads:
+        if (goodread(read, ignore_mate=True)):
+            if read.next_reference_name != read.reference_name:
+                mate_chrom = read.next_reference_name
+                mate_start = read.next_reference_start
+                mate_end = mate_start+150
+                itr = get_tabix_iter(mate_chrom, mate_start, mate_end, retros_tbx)
+                candidate_retros = pd.DataFrame([candidate_retro.strip().split()[:4] for candidate_retro in itr], columns=["chrom","start","end","family_class_name"])
+                candidate_retros['start'] = candidate_retros['start'].astype(int)
+                candidate_retros['end'] = candidate_retros['end'].astype(int)
+
+                for idx,candidate_retro in candidate_retros.iterrows():
+                    for retro_type in retro_matches:
+                        if retro_type in candidate_retro['family_class_name']:
+                            overlap_start = max(candidate_retro.loc['start'],mate_start)
+                            overlap_end = min(candidate_retro.loc['end'],mate_end)
+                            if (overlap_end-overlap_start) > 140:
+                                retro_matches[retro_type] += 1
+                            break
+    retros_count = 0
+    found_type = ""
+    for retro_type in retro_matches:
+        if retro_matches[retro_type] > 2:
+            retros_count +=1
+            found_type = retro_type
+    if retros_count == 1:
+        return True,found_type
+    return False,found_type
+
+
 
 
 def main(args):
     svs = parse_svs(args.bed)
-    svs = svs[(svs['end']-svs['start']) > 50]
+    retros_tbx = pysam.TabixFile(args.rmsk)
+    segdups = parse_repeats(args.repeats)
+    #replace with tabix
     likely_mechanisms = []
         
     for idx,sv in svs.iterrows():
-        if (sv.loc['end']-sv.loc['start']) < 50:
-            continue
         #check for breakpoint microhomology: replication-based errors
         repli_based_likely = is_microhomology_mediated(sv, args.ref)
         
         #check for breakpoint macrohomology: NAHR
-        nahr_likely = has_flanking_repeats(sv, args.repeats)
+        nahr_likely = has_flanking_repeats(sv, segdups)
+        nahr_likely = False
+
+        #check insertions for a retrotransposon scar
+        #if there is such a scar, also returns the class of retrotransposon (SINE, LINE, or SVA)
+        is_mei,mei_type = has_retrotransposon_scar(sv,retros_tbx)
         
         mechanism = ""
-        if nahr_likely:
+        if is_mei:
+            mechanism = mei_type
+        elif nahr_likely:
             mechanism = "NAHR"
         elif repli_based_likely:
             mechanism = "RBM"
