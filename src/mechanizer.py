@@ -287,7 +287,8 @@ def has_flanking_repeats(sv, repeats):
     # the first of the pair ends within 100 bp before the SV start and not after SV start
     # and the second of the pair starts after the SV end and within 100 bp after the SV end
     search_dist = int((sv.loc['end']-sv.loc['start'])/20)
-
+    
+    repeats["chrom"] = repeats['chrom'].astype(str)
     candidates = repeats[
               ((repeats["chrom"] == str(sv.loc['chrom']).strip("chr")) 
                   | (repeats["chrom"] == "chr"+str(sv.loc['chrom']))) 
@@ -378,7 +379,6 @@ def main(args):
         
         #check for breakpoint macrohomology: NAHR
         nahr_likely = has_flanking_repeats(sv, segdups)
-        nahr_likely = False
 
         #check insertions for a retrotransposon scar
         #if there is such a scar, also returns the class of retrotransposon (SINE, LINE, or SVA)
