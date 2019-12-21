@@ -63,22 +63,22 @@ def measure_homology(ref_file, chrom, start, end):
     downstream = None
     chrom = str(chrom)
     try:
-        upstream = reference.fetch(chrom, start-HOMOLOGY_CHECK_DIST, start)[HOMOLOGY_CHECK_DIST::-1]
+        upstream = reference.fetch(chrom, start-HOMOLOGY_CHECK_DIST, start)
         downstream = reference.fetch(chrom, end, end+HOMOLOGY_CHECK_DIST)
     except KeyError:
         if "chr" in chrom:
             chrom = chrom.strip("chr")
         else:
             chrom = "chr"+chrom
-        upstream = reference.fetch(chrom, start-HOMOLOGY_CHECK_DIST, start)[HOMOLOGY_CHECK_DIST::-1]
+        upstream = reference.fetch(chrom, start-HOMOLOGY_CHECK_DIST, start)
         downstream = reference.fetch(chrom, end, end+HOMOLOGY_CHECK_DIST)
     matchlen = 0
 
-    for i,downbase in enumerate(downstream):
-        if downbase == upstream[i]:
-            matchlen += 1
-        else:
-            break
+    up_len = len(upstream)
+    for i in range(2,len(downstream)):
+        if downstream[:i] == upstream[up_len-i:up_len+1]:
+            if i > matchlen:
+                matchlen = i
     return matchlen
 
 
@@ -328,8 +328,8 @@ def has_retrotransposon_scar(sv, retros_tbx):
         return False,0
 
     retro_matches = {
-        "LINE": 0,
-        "SINE": 0,
+        "L1": 0,
+        "Alu": 0,
         "SVA": 0
     }
     
@@ -381,18 +381,18 @@ def main(args):
         nahr_likely = has_flanking_repeats(sv, segdups)
 
         #check insertions for a retrotransposon scar
-        #if there is such a scar, also returns the class of retrotransposon (SINE, LINE, or SVA)
+        #if there is such a scar, also returns the class of retrotransposon (Alu, L1, or SVA)
         is_mei,mei_type = has_retrotransposon_scar(sv,retros_tbx)
         
         mechanism = ""
         if is_mei:
             mechanism = mei_type
         elif nahr_likely:
-            mechanism = "NAHR"
+            mechanism = "MACRO-HOMOLOGY"
         elif repli_based_likely:
-            mechanism = "RBM"
+            mechanism = "MICRO-HOMOLOGY"
         else:
-            mechanism = "NHEJ"
+            mechanism = "NON-HOMOLOGY"
         likely_mechanisms.append(mechanism)
     svs["pred_mechanism"] = likely_mechanisms
     svs.sort_values(by=['chrom','start','end'],inplace=True)
