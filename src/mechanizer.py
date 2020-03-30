@@ -52,6 +52,37 @@ def setup_args():
         sys.exit("ERROR: mechanizer requires either --bed argument")
     return args
 
+#def measure_homology(ref_file, chrom, start, end, splits):
+#    upstream = ""
+#    downstream = ""
+#
+#    for read in splits:
+#        if start-1 in read.get_reference_positions():
+#            loc = read.get_reference_positions().index(start-1)
+#            read_left = read.query_sequence[:loc+1]
+#            if len(read_left) > len(upstream):
+#                upstream = read_left
+#        elif end in read.get_reference_positions():
+#            loc = read.get_reference_positions().index(end)
+#            read_right = read.query_sequence[loc:]
+#            print(read.qname)
+#            print(read.query_sequence)
+#            print(read_right)
+#            sys.exit()
+#            if len(read_right) > len(downstream):
+#                downstream = read_right
+#    print(upstream[-10:])
+#    print(downstream)
+#    downstream = downstream[::-1]
+#
+#    i=0
+#    
+#    sys.exit()
+#    for i in range(min(len(downstream),len(upstream))):
+#        if not downstream[i] == upstream[i]:
+#            break
+#    return i
+    
 def measure_homology(ref_file, chrom, start, end):
     reference = pysam.FastaFile(ref_file)
     
@@ -175,28 +206,29 @@ def get_clipping(read):
     return clipstart,clipend 
 
 def is_microhomology_mediated(sv, ref):
-    left_supporting_splits = 0
-    right_supporting_splits = 0
-    non_supporting_splits = 0
+    left_supporting_splits = []
+    right_supporting_splits = []
+    non_supporting_splits = []
     splits = get_splits(sv.loc["bam"], sv.loc["chrom"], sv.loc["start"], sv.loc["end"])
     for split in splits:
         clipstart,clipend = get_clipping(split)
         if (((sv.loc["start"] - SPLITTER_ERR_MARGIN) <= clipstart <= (sv.loc["start"]+SPLITTER_ERR_MARGIN)) or
                 ((sv.loc["start"] - SPLITTER_ERR_MARGIN) <= clipend <= (sv.loc["start"]+SPLITTER_ERR_MARGIN))):
-            left_supporting_splits += 1
+            left_supporting_splits.append(split)
         elif (((sv.loc["end"] - SPLITTER_ERR_MARGIN) <= clipstart <= (sv.loc["end"]+SPLITTER_ERR_MARGIN)) or
                 ((sv.loc["end"] - SPLITTER_ERR_MARGIN) <= clipend <= (sv.loc["end"]+SPLITTER_ERR_MARGIN))):
-            right_supporting_splits += 1
+            right_supporting_splits.append(split)
         else:
-            non_supporting_splits += 1
+            non_supporting_splits.append(split)
     
     microhomology = 0
-    if (left_supporting_splits > 2
-            and right_supporting_splits > 2 
-            and (left_supporting_splits+right_supporting_splits) > non_supporting_splits):
+    if (len(left_supporting_splits) > 2
+            and len(right_supporting_splits) > 2 
+            and (len(left_supporting_splits)+len(right_supporting_splits)) > len(non_supporting_splits)):
         #we can be quite confident of the breakpoints
+        #microhomology = measure_homology(args.ref, sv.loc["chrom"], sv.loc["start"], sv.loc["end"], left_supporting_splits+right_supporting_splits)
         microhomology = measure_homology(args.ref, sv.loc["chrom"], sv.loc["start"], sv.loc["end"])
-    return (microhomology>2)
+    return (2 <= microhomology <= 10)
 
 
 
@@ -251,7 +283,7 @@ def parse_repeats(bed):
                     repeat_entry.append(to_int(fields[header_idxs[required_field]]))
                 repeats.append(repeat_entry)
     df = pd.DataFrame(repeats, columns=required_fields)
-    df['chrom'].astype(str)
+    df['chrom'] = df['chrom'].astype(str)
     return df
 
 def parse_repeat_masker(bed):
@@ -275,30 +307,37 @@ def parse_repeat_masker(bed):
                     repeat_entry.append(to_int(fields[header_idxs[required_field]]))
                 repeats.append(repeat_entry)
     df = pd.DataFrame(repeats, columns=required_fields)
-    df['chrom'].astype(str)
+    df['chrom'] = df['chrom'].astype(str)
     return df
 
 
-def has_flanking_repeats(sv, repeats):
+def get_flanking_repeats(sv, repeats):
     if sv.loc['svtype'] not in ["DEL","DUP"]:
-        return False
+        return []
 
     # find all the repeat pairs where 
-    # the first of the pair ends within 100 bp before the SV start and not after SV start
-    # and the second of the pair starts after the SV end and within 100 bp after the SV end
-    search_dist = int((sv.loc['end']-sv.loc['start'])/20)
+    # the first of the pair ends within 5% of the start breakpoint of the SV (either up or down)
+    # and the second of the pair starts within 5% of the end breakpoint
+    chrom = sv.loc['chrom'].strip("chr")
+    if 'chr' in repeats['chrom'].unique()[0]:
+        chrom = "chr"+chrom
+    start = sv.loc['start']
+    end = sv.loc['end']
+    search_scale_factor = 0.05
+    #extremely large variants have terrible breakpoint error, so increase the search distance
+    if (end-start)>500000:
+        search_scale_factor = 0.2
+    search_dist = int((end-start)*search_scale_factor)
     
     repeats["chrom"] = repeats['chrom'].astype(str)
     candidates = repeats[
-              ((repeats["chrom"] == str(sv.loc['chrom']).strip("chr")) 
-                  | (repeats["chrom"] == "chr"+str(sv.loc['chrom']))) 
-            & (repeats['end'] >= (sv.loc['start']-search_dist))
-            & (repeats['end'] <= sv.loc['start']+search_dist)
-            & (repeats['otherstart'] >= sv.loc['end']-search_dist)
-            & (repeats['otherstart'] <= (sv.loc['end']+search_dist))
+              (repeats["chrom"] == chrom) 
+            & (repeats['end'] >= (start-search_dist))
+            & (repeats['end'] <= (start+search_dist))
+            & (repeats['otherstart'] >= (end-search_dist))
+            & (repeats['otherstart'] <= (end+search_dist))
     ]
-
-    return (len(candidates) > 0)
+    return candidates
 
 def get_tabix_iter(chrom, start, end, tbx):
     itr = None
@@ -378,7 +417,8 @@ def main(args):
         repli_based_likely = is_microhomology_mediated(sv, args.ref)
         
         #check for breakpoint macrohomology: NAHR
-        nahr_likely = has_flanking_repeats(sv, segdups)
+        nahr_substrates = get_flanking_repeats(sv, segdups)
+        nahr_likely = len(nahr_substrates) >0
 
         #check insertions for a retrotransposon scar
         #if there is such a scar, also returns the class of retrotransposon (Alu, L1, or SVA)
@@ -388,11 +428,11 @@ def main(args):
         if is_mei:
             mechanism = mei_type
         elif nahr_likely:
-            mechanism = "MACRO-HOMOLOGY"
+            mechanism = "MACRO-HOM"
         elif repli_based_likely:
-            mechanism = "MICRO-HOMOLOGY"
+            mechanism = "MICRO-HOM"
         else:
-            mechanism = "NON-HOMOLOGY"
+            mechanism = "NON-HOM"
         likely_mechanisms.append(mechanism)
     svs["pred_mechanism"] = likely_mechanisms
     svs.sort_values(by=['chrom','start','end'],inplace=True)
